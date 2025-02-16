@@ -1,33 +1,31 @@
 require("dotenv").config();
 const express = require("express");
 const QRCode = require("qrcode");
-const AWS = require("aws-sdk");
-const multer = require("multer");
-const multerS3 = require("multer-s3");
+const { Readable } = require("stream");
+const { URL } = require("url");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configure AWS S3
-const s3 = new AWS.S3({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+// AWS SDK automatically loads credentials from ~/.aws/credentials
+const s3 = new S3Client({
   region: process.env.AWS_REGION,
+  // The credentials will automatically be loaded from AWS CLI settings
 });
 
-// Middleware to upload to S3
-const upload = multer({
-  storage: multerS3({
-    s3: s3,
-    bucket: process.env.S3_BUCKET_NAME,
-    acl: "public-read",
-    key: (req, file, cb) => {
-      cb(null, `qr_codes/${file.originalname}`);
-    },
-  }),
-});
+const sanitizeFilename = (url) => {
+  try {
+    const parsedUrl = new URL(url);
+    return (
+      parsedUrl.hostname +
+      parsedUrl.pathname.replace(/\W+/g, "-").replace(/^-+|-+$/g, "")
+    );
+  } catch (err) {
+    return null;
+  }
+};
 
-// API to generate and upload QR code to S3
 app.get("/generate", async (req, res) => {
   const { data } = req.query;
 
@@ -35,27 +33,42 @@ app.get("/generate", async (req, res) => {
     return res.status(400).json({ error: "Missing 'data' parameter" });
   }
 
-  const fileName = `${Buffer.from(data).toString("hex")}.png`;
+  const sanitizedFilename = sanitizeFilename(data);
+  if (!sanitizedFilename) {
+    return res.status(400).json({ error: "Invalid URL format" });
+  }
+
+  const fileName = `qr_codes/${sanitizedFilename}.png`;
 
   try {
-    // Generate QR Code as a buffer
-    const qrCodeBuffer = await QRCode.toBuffer(data);
+    console.log("Generating QR code for:", data);
+    const qrCodeBuffer = await QRCode.toBuffer(data, { type: "png" });
 
-    // Upload to S3
+    if (!qrCodeBuffer || qrCodeBuffer.length === 0) {
+      throw new Error("QR Code buffer is empty");
+    }
+
+    console.log("QR Code buffer generated, uploading to S3...");
+
     const uploadParams = {
       Bucket: process.env.S3_BUCKET_NAME,
-      Key: `qr_codes/${fileName}`,
-      Body: qrCodeBuffer,
+      Key: fileName,
+      Body: qrCodeBuffer, // Ensure this is not empty
       ContentType: "image/png",
-      ACL: "public-read",
     };
 
-    const uploadResult = await s3.upload(uploadParams).promise();
+    const command = new PutObjectCommand(uploadParams);
+    await s3.send(command);
 
-    res.json({ qrCodeUrl: uploadResult.Location });
+    const qrCodeUrl = `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
+
+    res.json({ qrCodeUrl });
   } catch (err) {
-    console.error("Error uploading QR code  :", err);
-    res.status(500).json({ error: "Error generating QR code" });
+    console.error("Error generating/uploading QR code:", err);
+    res.status(500).json({
+      error: "Server error while generating QR code",
+      details: err.message,
+    });
   }
 });
 
